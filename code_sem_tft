@@ -1,0 +1,128 @@
+#include <ESP32Servo.h> 
+
+#define  trigPin   4   
+#define  echoPin   5   
+#define  ServoPin  14  
+
+int stepDelay = 40; 
+
+int history0to180[91]; 
+int history180to0[91]; 
+
+bool initialScanDone = false; 
+
+Servo myServo; // Alterado de baseServo para myServo
+
+void setup(void)
+{
+      for(int i=0; i<91; i++) {
+        history0to180[i] = 0;
+        history180to0[i] = 0;
+      }
+
+      myServo.setPeriodHertz(50); 
+       
+      pinMode(trigPin, OUTPUT);       
+      pinMode(echoPin, INPUT);        
+      
+      Serial.begin(115200);
+      Serial.println("Radar Iniciado - A aguardar calibração...");
+             
+      myServo.attach(ServoPin, 500, 2400); 
+     
+      myServo.write(0);
+      delay(1000);
+}
+
+int calculateDistance()
+{ 
+      long duration;
+      digitalWrite(trigPin, LOW); 
+      delayMicroseconds(2);
+      digitalWrite(trigPin, HIGH); 
+      delayMicroseconds(10);
+      digitalWrite(trigPin, LOW);
+      duration = pulseIn(echoPin, HIGH);
+      return duration*0.034/2;
+}
+
+bool processarLogicaRadar(int angulo, int distanciaAtual, bool sentido0to180) {
+    int* memoriaAtual = sentido0to180 ? history0to180 : history180to0;
+    
+    int index = angulo / 2;
+    
+    int distanciaAntiga = memoriaAtual[index];
+    bool alerta = false;
+
+    if (!initialScanDone) {
+        memoriaAtual[index] = distanciaAtual;
+        return false; 
+    }
+
+    if (abs(distanciaAtual - distanciaAntiga) > 20 && distanciaAntiga > 0) {
+        alerta = true;
+    }
+    
+    return alerta;
+}
+
+void loop(void)
+{
+  int distance;
+  bool alertaDetectado = false;
+  
+  if (!initialScanDone) {
+    Serial.println("--- A CALIBRAR (PRIMEIRA VOLTA) ---");
+  }
+
+  for (int x = 0; x <= 180; x += 2){      
+      
+      myServo.write(x);              
+      delay(stepDelay); 
+      
+      distance = calculateDistance();
+
+      alertaDetectado = processarLogicaRadar(x, distance, true);
+      
+      Serial.print("Angulo: "); 
+      Serial.print(x); 
+      Serial.print(" | Dist: "); 
+      Serial.print(distance); 
+      Serial.print(" cm");
+      
+      if (alertaDetectado) {
+        Serial.print(" >>> [ALERTA DE MOVIMENTO] <<<");
+      }
+      Serial.println();
+  }
+
+  delay(1000); 
+
+  for (int x = 180; x >= 0; x -= 2){       
+      
+      myServo.write(x);              
+      delay(stepDelay);
+      
+      distance = calculateDistance();
+
+      alertaDetectado = processarLogicaRadar(x, distance, false); 
+
+      Serial.print("Angulo: "); 
+      Serial.print(x); 
+      Serial.print(" | Dist: "); 
+      Serial.print(distance); 
+      Serial.print(" cm");
+      
+      if (alertaDetectado) {
+        Serial.print(" >>> [ALERTA DE MOVIMENTO] <<<");
+      }
+      Serial.println();
+  }
+
+  delay(1000);
+  
+  if (!initialScanDone) {
+    initialScanDone = true;
+    Serial.println("--- CALIBRAÇÃO CONCLUÍDA. MODO VIGILÂNCIA ATIVO ---");
+  }
+}

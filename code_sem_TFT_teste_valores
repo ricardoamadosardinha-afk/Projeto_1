@@ -1,0 +1,164 @@
+#include <ESP32Servo.h> 
+
+#define  trigPin   5  
+#define  echoPin   4
+#define  ServoPin  14  
+
+int stepDelay = 400; 
+
+// Arrays para guardar o histórico (91 posições para ângulos 0 a 180, passo 2)
+int history0to180[91]; 
+int history180to0[91]; 
+
+bool initialScanDone = false; 
+
+Servo myServo; 
+
+void setup(void)
+{
+      // Inicializar arrays a 0
+      for(int i=0; i<91; i++) {
+        history0to180[i] = 0;
+        history180to0[i] = 0;
+      }
+
+      myServo.setPeriodHertz(50); 
+       
+      pinMode(trigPin, OUTPUT);       
+      pinMode(echoPin, INPUT);        
+      
+      Serial.begin(115200);
+      Serial.println("Radar Iniciado - A aguardar calibração...");
+             
+      myServo.attach(ServoPin, 500, 2400); 
+     
+      myServo.write(0);
+      delay(1000);
+}
+
+int calculateDistance()
+{ 
+      long duration;
+      digitalWrite(trigPin, LOW); 
+      delayMicroseconds(2);
+      digitalWrite(trigPin, HIGH); 
+      delayMicroseconds(10);
+      digitalWrite(trigPin, LOW);
+      duration = pulseIn(echoPin, HIGH);
+      return duration*0.034/2;
+}
+
+// Função que gere a lógica: decide se grava ou se compara
+bool processarLogicaRadar(int angulo, int distanciaAtual, bool sentido0to180) {
+    int* memoriaAtual = sentido0to180 ? history0to180 : history180to0;
+    int index = angulo / 2;
+    int distanciaAntiga = memoriaAtual[index];
+    bool alerta = false;
+
+    // Se é a primeira vez, GRAVA o valor na memória
+    if (!initialScanDone) {
+        memoriaAtual[index] = distanciaAtual;
+        return false; 
+    }
+
+    // Se já não é a primeira vez, COMPARA
+    if (abs(distanciaAtual - distanciaAntiga) > 20 && distanciaAntiga > 0) {
+        alerta = true;
+    }
+    
+    return alerta;
+}
+
+void loop(void)
+{
+  int distance;
+  int storedValue; // Variável para ler o que ficou na memória
+  bool alertaDetectado = false;
+  
+  if (!initialScanDone) {
+    Serial.println("--- A INICIAR CALIBRAÇÃO (PRIMEIRA VOLTA) ---");
+  }
+
+  // ==========================================
+  // 1. SWEEP 0 -> 180 (Anti-Horário)
+  // ==========================================
+  for (int x = 0; x <= 180; x += 2){      
+      
+      myServo.write(x);              
+      delay(stepDelay); 
+      
+      distance = calculateDistance();
+
+      // Processa (Grava ou Compara)
+      alertaDetectado = processarLogicaRadar(x, distance, true);
+      
+      // Lê o valor que está agora na memória para mostrar ao utilizador
+      storedValue = history0to180[x/2];
+
+      // --- IMPRESSÃO DE DEBUG PARA TESTE ---
+      Serial.print("Ang: "); 
+      Serial.print(x); 
+      Serial.print("\t| Atual: "); 
+      Serial.print(distance); 
+      Serial.print("cm \t| Mem: ");
+      Serial.print(storedValue); // Mostra o valor de referência
+      Serial.print("cm \t| ");
+
+      if (!initialScanDone) {
+        Serial.print("[A GRAVAR]");
+      } else {
+        Serial.print("[A COMPARAR]");
+      }
+      
+      if (alertaDetectado) {
+        Serial.print(" >>> [ALERTA] <<<");
+      }
+      Serial.println();
+  }
+
+  delay(1000); 
+
+  // ==========================================
+  // 2. SWEEP 180 -> 0 (Horário)
+  // ==========================================
+  for (int x = 180; x >= 0; x -= 2){       
+      
+      myServo.write(x);              
+      delay(stepDelay);
+      
+      distance = calculateDistance();
+
+      // Processa (Grava ou Compara)
+      alertaDetectado = processarLogicaRadar(x, distance, false); 
+      
+      // Lê o valor que está agora na memória
+      storedValue = history180to0[x/2];
+
+      // --- IMPRESSÃO DE DEBUG PARA TESTE ---
+      Serial.print("Ang: "); 
+      Serial.print(x); 
+      Serial.print("\t| Atual: "); 
+      Serial.print(distance); 
+      Serial.print("cm \t| Mem: ");
+      Serial.print(storedValue);
+      Serial.print("cm \t| ");
+      
+      if (!initialScanDone) {
+        Serial.print("[A GRAVAR]");
+      } else {
+        Serial.print("[A COMPARAR]");
+      }
+
+      if (alertaDetectado) {
+        Serial.print(" >>> [ALERTA] <<<");
+      }
+      Serial.println();
+  }
+
+  delay(1000);
+  
+  if (!initialScanDone) {
+    initialScanDone = true;
+    Serial.println("--- CALIBRAÇÃO CONCLUÍDA. MODO VIGILÂNCIA ATIVO ---");
+  }
+}
