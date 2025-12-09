@@ -9,6 +9,8 @@
 #define  ServoPin  14 
 #define  ButtonPin 2  // Botão entre Pino 2 e GND
 
+#define  LDRPin    12
+
 // --- DEFINIÇÕES GERAIS ---
 int Ymax = 240;              
 int Xmax = 320;              
@@ -16,6 +18,8 @@ int Xcent = Xmax / 2;
 int base = 210;              
 int scanline = 185;          
 int stepDelay = 40; // Velocidade do varrimento
+
+const int lightLevel = 3000;
 
 // --- MEMÓRIA DO RADAR (91 posições para ângulos 0 a 180, passo 2) ---
 int history0to180[91]; 
@@ -126,9 +130,21 @@ int calculateDistance() {
       digitalWrite(trigPin, HIGH); 
       delayMicroseconds(10);
       digitalWrite(trigPin, LOW);
-      duration = pulseIn(echoPin, HIGH);
+      duration = pulseIn(echoPin, HIGH,30000);
+
+      if (duration == 0) {
+        Serial.println("Erro: Sem eco (0)");
+      }
+      
       return duration*0.034/2;
 }
+
+int lerLuz() {
+    // Lê o valor analógico (0 a 4095 no ESP32)
+    return analogRead(LDRPin);
+}
+
+
 
 bool processarLogicaRadar(int angulo, int distanciaAtual, bool sentido0to180) {
     int* memoriaAtual = sentido0to180 ? history0to180 : history180to0;
@@ -141,7 +157,7 @@ bool processarLogicaRadar(int angulo, int distanciaAtual, bool sentido0to180) {
         return false; 
     }
 
-    if (abs(distanciaAtual - distanciaAntiga) > 20 && distanciaAntiga > 0) {
+    if (abs(distanciaAtual - distanciaAntiga) > 5 && distanciaAntiga > 0) {
         alerta = true;
     }
     return alerta;
@@ -230,6 +246,7 @@ void loop(void)
 
   // --- 2. SISTEMA ATIVO ---
   int distance;
+  int luz;
   int storedValue; 
   bool alertaDetectado = false;
   
@@ -248,6 +265,8 @@ void loop(void)
       delay(stepDelay); 
       
       distance = calculateDistance();
+      luz=lerLuz();
+
       alertaDetectado = processarLogicaRadar(x, distance, true);
       storedValue = history0to180[x/2]; // Para debug
 
@@ -263,6 +282,7 @@ void loop(void)
         // Serial Debug Rico
         Serial.print("DIR: >> | Ang: "); Serial.print(x); 
         Serial.print(" | Dist: "); Serial.print(distance); 
+        Serial.print("cm | Luz: "); Serial.print(luz);
         Serial.print(" | Mem: "); Serial.print(storedValue);
         if(alertaDetectado) Serial.print(" [ALERTA]");
         Serial.println();
@@ -280,6 +300,8 @@ void loop(void)
       delay(stepDelay);
       
       distance = calculateDistance();
+      luz=lerLuz();
+
       alertaDetectado = processarLogicaRadar(x, distance, false); 
       storedValue = history180to0[x/2];
 
@@ -293,6 +315,7 @@ void loop(void)
         // Serial Debug Rico
         Serial.print("DIR: << | Ang: "); Serial.print(x); 
         Serial.print(" | Dist: "); Serial.print(distance); 
+        Serial.print("cm | Luz: "); Serial.print(luz);
         Serial.print(" | Mem: "); Serial.print(storedValue);
         if(alertaDetectado) Serial.print(" [ALERTA]");
         Serial.println();
