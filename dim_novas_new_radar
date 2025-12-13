@@ -1,25 +1,82 @@
 #include <SPI.h>
-#include <TFT_eSPI.h> 
+#include <LovyanGFX.hpp> // Instalar via Library Manager
 #include <ESP32Servo.h>
 
-// --- OBJETOS ---
-TFT_eSPI tft = TFT_eSPI(); 
+// --- CONFIGURAÇÃO DO ECRÃ (LOVYANGFX) ---
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ILI9488 _panel_instance; // Driver ILI9488 (comum em 3.5")
+  lgfx::Bus_SPI       _bus_instance;   // Barramento SPI
+
+public:
+  LGFX(void) {
+    {
+      auto cfg = _bus_instance.config();
+      
+      // CONFIGURAÇÃO DOS PINOS SPI (ESP32-C6)
+      // Ajusta se tiveres ligado noutros pinos, mas estes são padrão para SPI
+      cfg.spi_host = SPI2_HOST; // Usar SPI2 no C6
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000; // 40MHz
+      cfg.freq_read  = 16000000;
+      cfg.spi_3wire  = false; // SPI normal (4 fios)
+      cfg.use_lock   = true;
+      cfg.dma_channel = SPI_DMA_CH_AUTO;
+
+      // Pinos definidos pelo utilizador
+      cfg.pin_sclk = 21;  // SCK (Confirma na tua placa, C6 costuma ser 21 ou 20)
+      cfg.pin_mosi = 19;  // MOSI (Confirma na tua placa, C6 costuma ser 19 ou 21)
+      cfg.pin_miso = -1;  // MISO (Não precisamos de ler do ecrã)
+      cfg.pin_dc   = 22;  // Data/Command
+      
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+
+    {
+      auto cfg = _panel_instance.config();
+
+      cfg.pin_cs           = 15;  // Chip Select
+      cfg.pin_rst          = 23;  // Reset
+      cfg.pin_busy         = -1; 
+
+      cfg.panel_width      = 320;
+      cfg.panel_height     = 480;
+      cfg.offset_x         = 0;
+      cfg.offset_y         = 0;
+      cfg.offset_rotation  = 0;
+      cfg.dummy_read_pixel = 8;
+      cfg.dummy_read_bits  = 1;
+      cfg.readable         = false; // ILI9488 SPI muitas vezes não permite leitura
+      cfg.invert           = false;
+      cfg.rgb_order        = false;
+      cfg.dlen_16bit       = false;
+      cfg.bus_shared       = false; 
+
+      _panel_instance.config(cfg);
+    }
+    
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX tft;                 // Instância do ecrã
 Servo myServo; 
 
-// --- PINOS ---
+// --- PINOS DO RADAR ---
 #define trigPin   4   
 #define echoPin   5   
 #define ServoPin  14 
 #define ButtonPin 2 
 
-// --- DEFINIÇÕES DO RADAR ---
+// --- DEFINIÇÕES ---
 #define MAX_DISTANCE_CM 150 
 #define SCAN_RADIUS 280     
 #define CENTER_X 240        
-#define CENTER_Y 320        
+#define CENTER_Y 320     
 
-// --- MEMÓRIA OTIMIZADA (91 Posições) ---
-// Ângulos: 0, 2, 4, ..., 180 (Total = 91 valores)
+int radarSpeed =200;
+
+// --- MEMÓRIA (91 POSIÇÕES) ---
 int background0to180[91];   
 int background180to0[91];   
 
@@ -32,7 +89,6 @@ void setup() {
   pinMode(echoPin, INPUT);
   pinMode(ButtonPin, INPUT_PULLUP);
   
-  // Inicializar arrays a 0
   for(int i=0; i<91; i++) {
     background0to180[i] = 0;
     background180to0[i] = 0;
@@ -46,16 +102,16 @@ void setup() {
 
   // 2. TFT Init
   tft.init();
-  tft.setRotation(1); 
+  tft.setRotation(1); // Paisagem
   tft.fillScreen(TFT_BLACK);
 
   // 3. Ecrã Inicial
   tft.setTextSize(2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawCentreString("RADAR 3.5 SPI", CENTER_X, 100, 1);
+  tft.drawCenterString("RADAR C6 LOVYAN", CENTER_X, 100);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawCentreString("PRESSIONE BOTAO", CENTER_X, 140, 1);
-  tft.drawCentreString("CALIBRACAO OTIMIZADA", CENTER_X, 170, 1);
+  tft.drawCenterString("PRESSIONE BOTAO", CENTER_X, 140);
+  tft.drawCenterString("PARA CALIBRAR", CENTER_X, 170);
 }
 
 // --- MEDIÇÃO ---
@@ -95,6 +151,7 @@ void renderRadarLine(int angle, int distance, bool isIntruder) {
   tft.drawLine(CENTER_X, CENTER_Y, lineX, lineY, TFT_GREEN);
 
   if (isIntruder && distance < MAX_DISTANCE_CM) {
+    // Mapeamento de distância
     int pixelDist = map(distance, 0, MAX_DISTANCE_CM, 0, SCAN_RADIUS);
     int objX = CENTER_X + pixelDist * cosA;
     int objY = CENTER_Y - pixelDist * sinA;
@@ -113,10 +170,10 @@ void renderRadarLine(int angle, int distance, bool isIntruder) {
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.setTextSize(1);
     tft.setCursor(5, 5);
-    tft.print("A Escanear...");
+    tft.print("Scan...");
   }
 
-  // Debug
+  // Debug Canto
   tft.fillRect(380, 0, 100, 40, TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(390, 5); tft.print("Ang: "); tft.print(angle);
@@ -133,28 +190,29 @@ void clearRadarLine(int angle) {
 }
 
 void loop() {
-  // 1. MODO DE CALIBRAÇÃO (USANDO INDEX i/2)
+  // MODO CALIBRAÇÃO
   if (!systemActive) {
     if (digitalRead(ButtonPin) == LOW) {
       tft.fillScreen(TFT_BLACK);
       
-      // Calibração Ida
       tft.setTextColor(TFT_CYAN, TFT_BLACK);
-      tft.drawCentreString("A CALIBRAR IDA...", CENTER_X, 140, 4);
+      tft.drawCenterString("CALIBRAR IDA...", CENTER_X, 140);
+      
+      // Calibração Ida
       for(int i=0; i<=180; i+=2) {
         myServo.write(i);
-        delay(30);
-        background0to180[i/2] = calculateDistance(); // Indexação corrigida
+        delay(radarSpeed); // <--- AQUI (Velocidade controlada)
+        background0to180[i/2] = calculateDistance();
       }
 
       tft.fillScreen(TFT_BLACK);
       
       // Calibração Volta
-      tft.drawCentreString("A CALIBRAR VOLTA...", CENTER_X, 140, 4);
+      tft.drawCenterString("CALIBRAR VOLTA...", CENTER_X, 140);
       for(int i=180; i>=0; i-=2) {
         myServo.write(i);
-        delay(30);
-        background180to0[i/2] = calculateDistance(); // Indexação corrigida
+        delay(radarSpeed); // <--- AQUI
+        background180to0[i/2] = calculateDistance();
       }
       
       calibrated = true;
@@ -166,25 +224,21 @@ void loop() {
     }
   }
 
-  // 2. MODO ATIVO
-  
-  // --- SWEEP 0 -> 180 ---
+  // MODO ATIVO (IDA)
   for (int i=0; i<=180; i+=2) {
     myServo.write(i);
-    delay(30); 
+    delay(radarSpeed); // <--- AQUI
     if(i > 0) clearRadarLine(i-2);
 
     int distAtual = calculateDistance();
     bool intruso = false;
     
-    // Calcula o índice correto para o array de 91 posições
     int index = i / 2;
     int distFundo = background0to180[index]; 
 
     if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
       intruso = true;
     } else {
-      // Atualização suave da memória
       if (abs(distAtual - distFundo) < 5) background0to180[index] = distAtual; 
     }
 
@@ -192,16 +246,15 @@ void loop() {
   }
   clearRadarLine(180);
 
-  // --- SWEEP 180 -> 0 ---
+  // MODO ATIVO (VOLTA)
   for (int i=180; i>=0; i-=2) {
     myServo.write(i);
-    delay(30);
+    delay(radarSpeed); // <--- AQUI
     if(i < 180) clearRadarLine(i+2);
 
     int distAtual = calculateDistance();
     bool intruso = false;
 
-    // Calcula o índice correto
     int index = i / 2;
     int distFundo = background180to0[index];
 
