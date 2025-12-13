@@ -1,0 +1,217 @@
+#include <SPI.h>
+#include <TFT_eSPI.h> 
+#include <ESP32Servo.h>
+
+// --- OBJETOS ---
+TFT_eSPI tft = TFT_eSPI(); 
+Servo myServo; 
+
+// --- PINOS ---
+#define trigPin   4   
+#define echoPin   5   
+#define ServoPin  14 
+#define ButtonPin 2 
+
+// --- DEFINIÇÕES DO RADAR ---
+#define MAX_DISTANCE_CM 150 
+#define SCAN_RADIUS 280     
+#define CENTER_X 240        
+#define CENTER_Y 320        
+
+// --- MEMÓRIA OTIMIZADA (91 Posições) ---
+// Ângulos: 0, 2, 4, ..., 180 (Total = 91 valores)
+int background0to180[91];   
+int background180to0[91];   
+
+bool calibrated = false;    
+bool systemActive = false;  
+
+void setup() {
+  // 1. Hardware
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ButtonPin, INPUT_PULLUP);
+  
+  // Inicializar arrays a 0
+  for(int i=0; i<91; i++) {
+    background0to180[i] = 0;
+    background180to0[i] = 0;
+  }
+
+  myServo.setPeriodHertz(50);
+  myServo.attach(ServoPin, 500, 2400);
+  myServo.write(90);
+
+  Serial.begin(115200);
+
+  // 2. TFT Init
+  tft.init();
+  tft.setRotation(1); 
+  tft.fillScreen(TFT_BLACK);
+
+  // 3. Ecrã Inicial
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("RADAR 3.5 SPI", CENTER_X, 100, 1);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawCentreString("PRESSIONE BOTAO", CENTER_X, 140, 1);
+  tft.drawCentreString("CALIBRACAO OTIMIZADA", CENTER_X, 170, 1);
+}
+
+// --- MEDIÇÃO ---
+int calculateDistance() { 
+  digitalWrite(trigPin, LOW); 
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); 
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000); 
+  if(duration == 0) return MAX_DISTANCE_CM + 10; 
+  return duration * 0.034 / 2;
+}
+
+// --- DESENHO GRELHA ---
+void drawGrid() {
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS, TFT_DARKGREEN);       
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.66, TFT_DARKGREEN);  
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.33, TFT_DARKGREEN);  
+
+  for (int i=30; i<=150; i+=30) {
+    float rad = radians(i);
+    int x = CENTER_X + SCAN_RADIUS * cos(rad);
+    int y = CENTER_Y - SCAN_RADIUS * sin(rad);
+    tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
+  }
+}
+
+// --- VISUALIZAÇÃO ---
+void renderRadarLine(int angle, int distance, bool isIntruder) {
+  float rad = radians(angle);
+  float cosA = cos(rad);
+  float sinA = sin(rad);
+
+  int lineX = CENTER_X + SCAN_RADIUS * cosA;
+  int lineY = CENTER_Y - SCAN_RADIUS * sinA;
+  tft.drawLine(CENTER_X, CENTER_Y, lineX, lineY, TFT_GREEN);
+
+  if (isIntruder && distance < MAX_DISTANCE_CM) {
+    int pixelDist = map(distance, 0, MAX_DISTANCE_CM, 0, SCAN_RADIUS);
+    int objX = CENTER_X + pixelDist * cosA;
+    int objY = CENTER_Y - pixelDist * sinA;
+    
+    tft.fillCircle(objX, objY, 5, TFT_RED);
+    
+    // Alerta
+    tft.fillRect(0, 0, 100, 30, TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK); 
+    tft.setTextSize(2);
+    tft.setCursor(5, 5);
+    tft.print("ALERTA!");
+  } else {
+    // Info Normal
+    tft.fillRect(0, 0, 100, 30, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(5, 5);
+    tft.print("A Escanear...");
+  }
+
+  // Debug
+  tft.fillRect(380, 0, 100, 40, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(390, 5); tft.print("Ang: "); tft.print(angle);
+  tft.setCursor(390, 20); tft.print("Dst: "); tft.print(distance);
+}
+
+void clearRadarLine(int angle) {
+  float rad = radians(angle);
+  int x = CENTER_X + SCAN_RADIUS * cos(rad);
+  int y = CENTER_Y - SCAN_RADIUS * sin(rad);
+  tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_BLACK);
+  
+  if (angle % 30 == 0) tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
+}
+
+void loop() {
+  // 1. MODO DE CALIBRAÇÃO (USANDO INDEX i/2)
+  if (!systemActive) {
+    if (digitalRead(ButtonPin) == LOW) {
+      tft.fillScreen(TFT_BLACK);
+      
+      // Calibração Ida
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.drawCentreString("A CALIBRAR IDA...", CENTER_X, 140, 4);
+      for(int i=0; i<=180; i+=2) {
+        myServo.write(i);
+        delay(30);
+        background0to180[i/2] = calculateDistance(); // Indexação corrigida
+      }
+
+      tft.fillScreen(TFT_BLACK);
+      
+      // Calibração Volta
+      tft.drawCentreString("A CALIBRAR VOLTA...", CENTER_X, 140, 4);
+      for(int i=180; i>=0; i-=2) {
+        myServo.write(i);
+        delay(30);
+        background180to0[i/2] = calculateDistance(); // Indexação corrigida
+      }
+      
+      calibrated = true;
+      systemActive = true;
+      tft.fillScreen(TFT_BLACK);
+      drawGrid();
+    } else {
+      return;
+    }
+  }
+
+  // 2. MODO ATIVO
+  
+  // --- SWEEP 0 -> 180 ---
+  for (int i=0; i<=180; i+=2) {
+    myServo.write(i);
+    delay(30); 
+    if(i > 0) clearRadarLine(i-2);
+
+    int distAtual = calculateDistance();
+    bool intruso = false;
+    
+    // Calcula o índice correto para o array de 91 posições
+    int index = i / 2;
+    int distFundo = background0to180[index]; 
+
+    if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
+      intruso = true;
+    } else {
+      // Atualização suave da memória
+      if (abs(distAtual - distFundo) < 5) background0to180[index] = distAtual; 
+    }
+
+    renderRadarLine(i, distAtual, intruso);
+  }
+  clearRadarLine(180);
+
+  // --- SWEEP 180 -> 0 ---
+  for (int i=180; i>=0; i-=2) {
+    myServo.write(i);
+    delay(30);
+    if(i < 180) clearRadarLine(i+2);
+
+    int distAtual = calculateDistance();
+    bool intruso = false;
+
+    // Calcula o índice correto
+    int index = i / 2;
+    int distFundo = background180to0[index];
+
+    if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
+      intruso = true;
+    } else {
+      if (abs(distAtual - distFundo) < 5) background180to0[index] = distAtual;
+    }
+
+    renderRadarLine(i, distAtual, intruso);
+  }
+  clearRadarLine(0);
+}
