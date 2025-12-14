@@ -1,30 +1,32 @@
 #include <SPI.h>
-#include <LovyanGFX.hpp> 
+#include <LovyanGFX.hpp> // Instalar via Library Manager
 #include <ESP32Servo.h>
 
 // --- CONFIGURAÇÃO DO ECRÃ (LOVYANGFX) ---
 class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ILI9488 _panel_instance; 
-  lgfx::Bus_SPI       _bus_instance;   
+  lgfx::Panel_ILI9488 _panel_instance; // Driver ILI9488 (comum em 3.5")
+  lgfx::Bus_SPI       _bus_instance;   // Barramento SPI
 
 public:
   LGFX(void) {
     {
       auto cfg = _bus_instance.config();
       
-      cfg.spi_host = SPI2_HOST; 
+      // CONFIGURAÇÃO DOS PINOS SPI (ESP32-C6)
+      // Ajusta se tiveres ligado noutros pinos, mas estes são padrão para SPI
+      cfg.spi_host = SPI2_HOST; // Usar SPI2 no C6
       cfg.spi_mode = 0;
-      cfg.freq_write = 40000000; 
+      cfg.freq_write = 40000000; // 40MHz
       cfg.freq_read  = 16000000;
-      cfg.spi_3wire  = false; 
+      cfg.spi_3wire  = false; // SPI normal (4 fios)
       cfg.use_lock   = true;
       cfg.dma_channel = SPI_DMA_CH_AUTO;
 
-      // Pinos ESP32-C6
-      cfg.pin_sclk = 21;  
-      cfg.pin_mosi = 19;  
-      cfg.pin_miso = -1;  
-      cfg.pin_dc   = 22;  
+      // Pinos definidos pelo utilizador
+      cfg.pin_sclk = 21;  // SCK (Confirma na tua placa, C6 costuma ser 21 ou 20)
+      cfg.pin_mosi = 19;  // MOSI (Confirma na tua placa, C6 costuma ser 19 ou 21)
+      cfg.pin_miso = -1;  // MISO (Não precisamos de ler do ecrã)
+      cfg.pin_dc   = 22;  // Data/Command
       
       _bus_instance.config(cfg);
       _panel_instance.setBus(&_bus_instance);
@@ -33,8 +35,8 @@ public:
     {
       auto cfg = _panel_instance.config();
 
-      cfg.pin_cs           = 15;  
-      cfg.pin_rst          = 23;  
+      cfg.pin_cs           = 15;  // Chip Select
+      cfg.pin_rst          = 23;  // Reset
       cfg.pin_busy         = -1; 
 
       cfg.panel_width      = 320;
@@ -44,7 +46,7 @@ public:
       cfg.offset_rotation  = 0;
       cfg.dummy_read_pixel = 8;
       cfg.dummy_read_bits  = 1;
-      cfg.readable         = false; 
+      cfg.readable         = false; // ILI9488 SPI muitas vezes não permite leitura
       cfg.invert           = false;
       cfg.rgb_order        = false;
       cfg.dlen_16bit       = false;
@@ -57,27 +59,24 @@ public:
   }
 };
 
-LGFX tft;                 
+LGFX tft;                 // Instância do ecrã
 Servo myServo; 
 
-// --- PINOS ---
+// --- PINOS DO RADAR ---
 #define trigPin   4   
 #define echoPin   5   
 #define ServoPin  14 
 #define ButtonPin 2 
-const int ldrPin = 1; // Pino do LDR
 
-// --- DEFINIÇÕES DO RADAR ---
+// --- DEFINIÇÕES ---
 #define MAX_DISTANCE_CM 150 
-#define SCAN_RADIUS 220     
+#define SCAN_RADIUS 280     
 #define CENTER_X 240        
-#define CENTER_Y 300        
-int radarSpeed = 300; // Velocidade do Servo
+#define CENTER_Y 320     
 
-// --- DEFINIÇÕES DE LUZ ---
-const int lightThreshold = 800; 
+int radarSpeed =200;
 
-// --- MEMÓRIA ---
+// --- MEMÓRIA (91 POSIÇÕES) ---
 int background0to180[91];   
 int background180to0[91];   
 
@@ -85,14 +84,10 @@ bool calibrated = false;
 bool systemActive = false;  
 
 void setup() {
-  // 1. Hardware Init
+  // 1. Hardware
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
   pinMode(ButtonPin, INPUT_PULLUP);
-  
-  // Configuração LDR
-  pinMode(ldrPin, INPUT);
-  analogReadResolution(12); // Garante leitura 0-4095
   
   for(int i=0; i<91; i++) {
     background0to180[i] = 0;
@@ -107,21 +102,19 @@ void setup() {
 
   // 2. TFT Init
   tft.init();
-  tft.setRotation(1); 
+  tft.setRotation(1); // Paisagem
   tft.fillScreen(TFT_BLACK);
 
-  // Ecrã de Boot
+  // 3. Ecrã Inicial
   tft.setTextSize(2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawCenterString("SISTEMA HIBRIDO", CENTER_X, 80);
+  tft.drawCenterString("RADAR C6 LOVYAN", CENTER_X, 100);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawCenterString("PRESSIONE BOTAO", CENTER_X, 120);
-  tft.drawCenterString("SERIAL DEBUG ATIVO", CENTER_X, 150);
-  
-  Serial.println("--- SISTEMA INICIADO ---");
-  Serial.println("Aguardando botao para calibrar...");
+  tft.drawCenterString("PRESSIONE BOTAO", CENTER_X, 140);
+  tft.drawCenterString("PARA CALIBRAR", CENTER_X, 170);
 }
 
+// --- MEDIÇÃO ---
 int calculateDistance() { 
   digitalWrite(trigPin, LOW); 
   delayMicroseconds(2);
@@ -133,34 +126,7 @@ int calculateDistance() {
   return duration * 0.034 / 2;
 }
 
-// --- FUNÇÃO DE LUZ (Agora retorna int) ---
-int verificarLuz() {
-  int sensorValue = analogRead(ldrPin);
-  
-  // Desenho na GUI
-  tft.fillRect(0, 40, 140, 40, TFT_BLACK); 
-  
-  if (sensorValue < lightThreshold) {
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(10, 45);
-    tft.print("ALERTA LUZ!");
-    
-    tft.setTextSize(1);
-    tft.setCursor(10, 65);
-    tft.print("Val: "); tft.print(sensorValue);
-  } else {
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setTextSize(1);
-    tft.setCursor(10, 45);
-    tft.print("Luz Normal");
-    tft.setCursor(10, 60);
-    tft.print("Val: "); tft.print(sensorValue);
-  }
-  
-  return sensorValue; // Retorna para usarmos no Serial
-}
-
+// --- DESENHO GRELHA ---
 void drawGrid() {
   tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS, TFT_DARKGREEN);       
   tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.66, TFT_DARKGREEN);  
@@ -174,6 +140,7 @@ void drawGrid() {
   }
 }
 
+// --- VISUALIZAÇÃO ---
 void renderRadarLine(int angle, int distance, bool isIntruder) {
   float rad = radians(angle);
   float cosA = cos(rad);
@@ -184,26 +151,29 @@ void renderRadarLine(int angle, int distance, bool isIntruder) {
   tft.drawLine(CENTER_X, CENTER_Y, lineX, lineY, TFT_GREEN);
 
   if (isIntruder && distance < MAX_DISTANCE_CM) {
+    // Mapeamento de distância
     int pixelDist = map(distance, 0, MAX_DISTANCE_CM, 0, SCAN_RADIUS);
     int objX = CENTER_X + pixelDist * cosA;
     int objY = CENTER_Y - pixelDist * sinA;
     
     tft.fillCircle(objX, objY, 5, TFT_RED);
     
-    tft.fillRect(0, 0, 140, 35, TFT_BLACK);
+    // Alerta
+    tft.fillRect(0, 0, 100, 30, TFT_BLACK);
     tft.setTextColor(TFT_RED, TFT_BLACK); 
     tft.setTextSize(2);
-    tft.setCursor(10, 10);
-    tft.print("INTRUSO!");
+    tft.setCursor(5, 5);
+    tft.print("ALERTA!");
   } else {
-    tft.fillRect(0, 0, 140, 35, TFT_BLACK);
+    // Info Normal
+    tft.fillRect(0, 0, 100, 30, TFT_BLACK);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.setTextSize(1);
-    tft.setCursor(10, 10);
-    tft.print("Radar Scan...");
+    tft.setCursor(5, 5);
+    tft.print("Scan...");
   }
 
-  // Debug Ecrã
+  // Debug Canto
   tft.fillRect(380, 0, 100, 40, TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(390, 5); tft.print("Ang: "); tft.print(angle);
@@ -219,73 +189,50 @@ void clearRadarLine(int angle) {
   if (angle % 30 == 0) tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
 }
 
-// --- FUNÇÃO AUXILIAR PARA IMPRIMIR SERIAL ---
-void printDebug(int angle, int dist, int light, bool intruder) {
-  Serial.print("ANG: "); 
-  if(angle < 10) Serial.print("00");
-  else if(angle < 100) Serial.print("0");
-  Serial.print(angle);
-  
-  Serial.print("\t| DIST: "); 
-  Serial.print(dist);
-  Serial.print("cm");
-  
-  Serial.print("\t| LUZ: "); 
-  Serial.print(light);
-  
-  // Marcadores visuais de alerta
-  if (intruder) Serial.print(" \t[ALERTA MOVIMENTO !!!]");
-  if (light < lightThreshold) Serial.print(" \t[ALERTA LUZ !!!]");
-  
-  Serial.println(); // Nova linha
-}
-
 void loop() {
-  // --- MODO CALIBRAÇÃO ---
+  // MODO CALIBRAÇÃO
   if (!systemActive) {
     if (digitalRead(ButtonPin) == LOW) {
-      Serial.println(">>> INICIANDO CALIBRACAO <<<");
       tft.fillScreen(TFT_BLACK);
       
       tft.setTextColor(TFT_CYAN, TFT_BLACK);
       tft.drawCenterString("CALIBRAR IDA...", CENTER_X, 140);
+      
+      // Calibração Ida
       for(int i=0; i<=180; i+=2) {
         myServo.write(i);
-        delay(radarSpeed);
+        delay(radarSpeed); // <--- AQUI (Velocidade controlada)
         background0to180[i/2] = calculateDistance();
       }
 
       tft.fillScreen(TFT_BLACK);
       
+      // Calibração Volta
       tft.drawCenterString("CALIBRAR VOLTA...", CENTER_X, 140);
       for(int i=180; i>=0; i-=2) {
         myServo.write(i);
-        delay(radarSpeed);
+        delay(radarSpeed); // <--- AQUI
         background180to0[i/2] = calculateDistance();
       }
       
       calibrated = true;
       systemActive = true;
-      Serial.println(">>> CALIBRACAO CONCLUIDA <<<");
       tft.fillScreen(TFT_BLACK);
       drawGrid();
     } else {
-      // Mesmo em espera, mostra a luz no serial para testar o LDR
-      int valLuz = verificarLuz();
-      Serial.print("STANDBY - LUZ: "); Serial.println(valLuz);
-      delay(200);
       return;
     }
   }
 
-  // --- MODO ATIVO (IDA) ---
+  // MODO ATIVO (IDA)
   for (int i=0; i<=180; i+=2) {
     myServo.write(i);
-    delay(radarSpeed); 
+    delay(radarSpeed); // <--- AQUI
     if(i > 0) clearRadarLine(i-2);
 
     int distAtual = calculateDistance();
     bool intruso = false;
+    
     int index = i / 2;
     int distFundo = background0to180[index]; 
 
@@ -296,21 +243,18 @@ void loop() {
     }
 
     renderRadarLine(i, distAtual, intruso);
-    int valLuz = verificarLuz();
-    
-    // OUTPUT SERIAL
-    printDebug(i, distAtual, valLuz, intruso);
   }
   clearRadarLine(180);
 
-  // --- MODO ATIVO (VOLTA) ---
+  // MODO ATIVO (VOLTA)
   for (int i=180; i>=0; i-=2) {
     myServo.write(i);
-    delay(radarSpeed);
+    delay(radarSpeed); // <--- AQUI
     if(i < 180) clearRadarLine(i+2);
 
     int distAtual = calculateDistance();
     bool intruso = false;
+
     int index = i / 2;
     int distFundo = background180to0[index];
 
@@ -321,10 +265,6 @@ void loop() {
     }
 
     renderRadarLine(i, distAtual, intruso);
-    int valLuz = verificarLuz();
-
-    // OUTPUT SERIAL
-    printDebug(i, distAtual, valLuz, intruso);
   }
   clearRadarLine(0);
 }
