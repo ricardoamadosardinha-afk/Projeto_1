@@ -1,0 +1,608 @@
+Com certeza\! Aqui está o código **completo e unificado** para o seu **ESP32-C6 DevKitMini**. Este código gerencia o radar, o display TFT (LovyanGFX), o sensor LDR, a calibração, e o servidor web com WebSocket para notificar o navegador sobre os três estados de alerta (`MOVIMENTO`, `LUZ`, ou `NORMAL`).
+
+-----
+
+## 💾 Código Final Completo para ESP32-C6
+
+Lembre-se de substituir o `SEU_WIFI_SSID` e a `SUA_PASSWORD` no início.
+
+```cpp
+// ======================================================================
+// === 1. BIBLIOTECAS E CONFIGURAÇÕES DE ALTO NÍVEL =====================
+// ======================================================================
+
+// --- BIBLIOTECAS ESSENCIAIS ---
+#include <SPI.h>
+#include <LovyanGFX.hpp> 
+#include <ESP32Servo.h>
+
+// --- BIBLIOTECAS DE REDE ---
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+// --- CONFIGURAÇÃO DE REDE ---
+const char* ssid = "SEU_WIFI_SSID"; // <-- ALTERE AQUI!
+const char* password = "SUA_PASSWORD"; // <-- ALTERE AQUI!
+IPAddress local_IP(192, 168, 1, 180); 
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// --- WEBSOCKET E VARIÁVEL DE ALERTA ---
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// Variável Global: "MOVIMENTO", "LUZ" ou "NORMAL"
+String estadoAlertaWeb = "NORMAL"; 
+bool alertaMovimentoAtivo = false;
+bool alertaLuzAtivo = false;
+
+// --- CONFIGURAÇÃO DO ECRÃ (LOVYANGFX) ---
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ILI9488 _panel_instance; 
+  lgfx::Bus_SPI       _bus_instance;  
+
+public:
+  LGFX(void) {
+    {
+      auto cfg = _bus_instance.config();
+      cfg.spi_host = SPI2_HOST; 
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000; 
+      cfg.freq_read  = 16000000;
+      cfg.spi_3wire  = false; 
+      cfg.use_lock   = true;
+      cfg.dma_channel = SPI_DMA_CH_AUTO;
+
+      // Pinos ESP32-C6
+      cfg.pin_sclk = 21;  
+      cfg.pin_mosi = 19;  
+      cfg.pin_miso = -1;  
+      cfg.pin_dc   = 22;  
+      
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+
+    {
+      auto cfg = _panel_instance.config();
+      cfg.pin_cs           = 15;  
+      cfg.pin_rst          = 23;  
+      cfg.pin_busy         = -1; 
+
+      cfg.panel_width      = 320;
+      cfg.panel_height     = 480;
+      cfg.offset_rotation  = 0;
+      cfg.readable         = false; 
+      cfg.invert           = false;
+      cfg.rgb_order        = false;
+      
+      _panel_instance.config(cfg);
+    }
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX tft;                 
+Servo myServo; 
+
+// --- PINOS ---
+#define trigPin   4   
+#define echoPin   5   
+#define ServoPin  14 
+#define ButtonPin 2 
+const int ldrPin = 1; // Pino do LDR
+
+// --- DEFINIÇÕES DO RADAR ---
+#define MAX_DISTANCE_CM 150 
+#define SCAN_RADIUS 220     
+#define CENTER_X 240        
+#define CENTER_Y 300        
+int radarSpeed = 30; 
+
+// --- DEFINIÇÕES DE LUZ ---
+const int lightThreshold = 800; 
+
+// --- MEMÓRIA ---
+int background0to180[91];   
+int background180to0[91];   
+
+bool calibrated = false;    
+bool systemActive = false;  
+
+// ======================================================================
+// === 2. FUNÇÕES DE REDE E WEBSOCKET ===================================
+// ======================================================================
+
+void notifyClients() {
+  ws.textAll(estadoAlertaWeb);
+}
+
+void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+  if(type == WS_EVT_CONNECT){
+    Serial.println("Cliente WebSocket conectado.");
+    notifyClients(); 
+  } else if(type == WS_EVT_DISCONNECT){
+    Serial.println("Cliente WebSocket desconectado.");
+  }
+}
+
+void initWebSocket() {
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", HTML_CONTENT);
+  });
+  server.begin();
+}
+
+void initWiFi() {
+  Serial.print("Conectando-se a: ");
+  Serial.println(ssid);
+  
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("Falha na Configuração de IP Estático!");
+  }
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("Wi-Fi Conectado!");
+  Serial.print("Endereço IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ======================================================================
+// === 3. FUNÇÕES DE MEDIÇÃO E DESENHO (RADAR/LDR) ======================
+// ======================================================================
+
+int calculateDistance() { 
+  digitalWrite(trigPin, LOW); 
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); 
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000); 
+  if(duration == 0) return MAX_DISTANCE_CM + 10; 
+  return duration * 0.034 / 2;
+}
+
+int verificarLuz() {
+  int sensorValue = analogRead(ldrPin);
+  bool luzFraca = (sensorValue < lightThreshold);
+
+  tft.fillRect(0, 40, 140, 40, TFT_BLACK); 
+  
+  if (luzFraca) {
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 45);
+    tft.print("ALERTA LUZ!");
+    
+    tft.setTextSize(1);
+    tft.setCursor(10, 65);
+    tft.print("Val: "); tft.print(sensorValue);
+  
+    if (!alertaLuzAtivo) {
+        alertaLuzAtivo = true;
+        // Se a luz for o primeiro alerta e não houver movimento, notifica
+        if (estadoAlertaWeb != "MOVIMENTO") { 
+            estadoAlertaWeb = "LUZ";
+            notifyClients();
+        }
+    }
+  } else {
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(10, 45);
+    tft.print("Luz Normal");
+    tft.setCursor(10, 60);
+    tft.print("Val: "); tft.print(sensorValue);
+    
+    if (alertaLuzAtivo) {
+        alertaLuzAtivo = false;
+    }
+  }
+  
+  return sensorValue; 
+}
+
+void drawGrid() {
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS, TFT_DARKGREEN);       
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.66, TFT_DARKGREEN);  
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.33, TFT_DARKGREEN);  
+
+  for (int i=30; i<=150; i+=30) {
+    float rad = radians(i);
+    int x = CENTER_X + SCAN_RADIUS * cos(rad);
+    int y = CENTER_Y - SCAN_RADIUS * sin(rad);
+    tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
+  }
+}
+
+void renderRadarLine(int angle, int distance, bool isIntruder) {
+  float rad = radians(angle);
+  float cosA = cos(rad);
+  float sinA = sin(rad);
+
+  int lineX = CENTER_X + SCAN_RADIUS * cosA;
+  int lineY = CENTER_Y - SCAN_RADIUS * sinA;
+  tft.drawLine(CENTER_X, CENTER_Y, lineX, lineY, TFT_GREEN);
+
+  if (isIntruder && distance < MAX_DISTANCE_CM) {
+    int pixelDist = map(distance, 0, MAX_DISTANCE_CM, 0, SCAN_RADIUS);
+    int objX = CENTER_X + pixelDist * cosA;
+    int objY = CENTER_Y - pixelDist * sinA;
+    
+    tft.fillCircle(objX, objY, 5, TFT_RED);
+    
+    tft.fillRect(0, 0, 140, 35, TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK); 
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.print("INTRUSO!");
+    
+    alertaMovimentoAtivo = intruso;
+  } else {
+    tft.fillRect(0, 0, 140, 35, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(10, 10);
+    tft.print("Radar Scan...");
+  }
+
+  tft.fillRect(380, 0, 100, 40, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(390, 5); tft.print("Ang: "); tft.print(angle);
+  tft.setCursor(390, 20); tft.print("Dst: "); tft.print(distance);
+}
+
+void clearRadarLine(int angle) {
+  float rad = radians(angle);
+  int x = CENTER_X + SCAN_RADIUS * cos(rad);
+  int y = CENTER_Y - SCAN_RADIUS * sin(rad);
+  tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_BLACK);
+  
+  if (angle % 30 == 0) tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
+}
+
+void printDebug(int angle, int dist, int light, bool intruder) {
+  Serial.print("ANG: "); 
+  if(angle < 10) Serial.print("00");
+  else if(angle < 100) Serial.print("0");
+  Serial.print(angle);
+  
+  Serial.print("\t| DIST: "); 
+  Serial.print(dist);
+  Serial.print("cm");
+  
+  Serial.print("\t| LUZ: "); 
+  Serial.print(light);
+  
+  if (intruder) Serial.print(" \t[ALERTA MOVIMENTO !!!]");
+  if (light < lightThreshold) Serial.print(" \t[ALERTA LUZ !!!]");
+  
+  Serial.println();
+}
+
+// ======================================================================
+// === 4. SETUP E LOOP PRINCIPAL ========================================
+// ======================================================================
+
+void setup() {
+  // 1. Hardware Init
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ButtonPin, INPUT_PULLUP);
+  pinMode(ldrPin, INPUT);
+  analogReadResolution(12); 
+  
+  for(int i=0; i<91; i++) {
+    background0to180[i] = 0;
+    background180to0[i] = 0;
+  }
+
+  myServo.setPeriodHertz(50);
+  myServo.attach(ServoPin, 500, 2400);
+  myServo.write(90);
+
+  Serial.begin(115200);
+
+  // 2. TFT Init
+  tft.init();
+  tft.setRotation(1); 
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCenterString("SISTEMA HIBRIDO", CENTER_X, 80);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawCenterString("PRESSIONE BOTAO", CENTER_X, 120);
+
+  // 3. Wi-Fi e Servidor Web
+  initWiFi();
+  initWebSocket();
+  tft.drawCenterString("WEB OK: " + String(WiFi.localIP()), CENTER_X, 180);
+
+  Serial.println("--- SISTEMA INICIADO ---");
+  Serial.println("Aguardando botao para calibrar...");
+}
+
+void loop() {
+  ws.cleanupClients(); 
+  
+  // --- MODO CALIBRAÇÃO / ESPERA ---
+  if (!systemActive) {
+    if (digitalRead(ButtonPin) == LOW) {
+      Serial.println(">>> INICIANDO CALIBRACAO <<<");
+      tft.fillScreen(TFT_BLACK);
+      
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.drawCenterString("CALIBRAR IDA...", CENTER_X, 140);
+      for(int i=0; i<=180; i+=2) {
+        myServo.write(i);
+        delay(radarSpeed);
+        background0to180[i/2] = calculateDistance();
+      }
+
+      tft.fillScreen(TFT_BLACK);
+      
+      tft.drawCenterString("CALIBRAR VOLTA...", CENTER_X, 140);
+      for(int i=180; i>=0; i-=2) {
+        myServo.write(i);
+        delay(radarSpeed);
+        background180to0[i/2] = calculateDistance();
+      }
+      
+      calibrated = true;
+      systemActive = true;
+      Serial.println(">>> CALIBRACAO CONCLUIDA <<<");
+      tft.fillScreen(TFT_BLACK);
+      drawGrid();
+
+    } else {
+      // Em espera: verifica luz e atualiza o estado web
+      int valLuz = verificarLuz(); 
+      if (alertaLuzAtivo) {
+          estadoAlertaWeb = "LUZ";
+          notifyClients();
+      } else if (estadoAlertaWeb != "NORMAL") {
+          estadoAlertaWeb = "NORMAL";
+          notifyClients();
+      }
+      Serial.print("STANDBY - LUZ: "); Serial.println(valLuz);
+      delay(200);
+      return;
+    }
+  }
+  
+  // --- MODO ATIVO ---
+  bool cicloComAlertaMovimento = false; 
+  int distAtual;
+  bool intruso;
+  int index;
+  int distFundo;
+  int valLuz;
+
+  // IDA (0 -> 180)
+  for (int i=0; i<=180; i+=2) {
+    myServo.write(i);
+    delay(radarSpeed); 
+    if(i > 0) clearRadarLine(i-2);
+
+    distAtual = calculateDistance();
+    intruso = false;
+    index = i / 2;
+    distFundo = background0to180[index]; 
+
+    if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
+      intruso = true;
+      cicloComAlertaMovimento = true; 
+    } else {
+      if (abs(distAtual - distFundo) < 5) background0to180[index] = distAtual; 
+    }
+
+    alertaMovimentoAtivo = intruso; 
+    renderRadarLine(i, distAtual, intruso);
+    valLuz = verificarLuz();
+    
+    printDebug(i, distAtual, valLuz, intruso);
+    
+    if (alertaMovimentoAtivo && estadoAlertaWeb != "MOVIMENTO") {
+        estadoAlertaWeb = "MOVIMENTO";
+        notifyClients();
+    }
+ }
+ clearRadarLine(180);
+
+
+  // VOLTA (180 -> 0)
+  for (int i=180; i>=0; i-=2) {
+    myServo.write(i);
+    delay(radarSpeed);
+    if(i < 180) clearRadarLine(i+2);
+
+    distAtual = calculateDistance();
+    intruso = false;
+    index = i / 2;
+    distFundo = background180to0[index];
+
+    if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
+      intruso = true;
+      cicloComAlertaMovimento = true; 
+    } else {
+      if (abs(distAtual - distFundo) < 5) background180to0[index] = distAtual;
+    }
+
+    alertaMovimentoAtivo = intruso;
+    renderRadarLine(i, distAtual, intruso);
+    valLuz = verificarLuz();
+
+    printDebug(i, distAtual, valLuz, intruso);
+
+    if (alertaMovimentoAtivo && estadoAlertaWeb != "MOVIMENTO") {
+        estadoAlertaWeb = "MOVIMENTO";
+        notifyClients();
+    }
+  }
+ clearRadarLine(0);
+
+ // --- VERIFICAÇÃO FINAL APÓS O CICLO ---
+ if (!cicloComAlertaMovimento) {
+    alertaMovimentoAtivo = false;
+    if (alertaLuzAtivo) {
+        if (estadoAlertaWeb != "LUZ") {
+            estadoAlertaWeb = "LUZ";
+            notifyClients();
+        }
+    } else {
+        if (estadoAlertaWeb != "NORMAL") {
+            estadoAlertaWeb = "NORMAL";
+            notifyClients();
+        }
+    }
+ }
+}
+
+
+// ======================================================================
+// === 5. WEBSITE (HTML, CSS, JAVASCRIPT) ===============================
+// ======================================================================
+const char HTML_CONTENT[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radar Híbrido ESP32-C6</title>
+<style>
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+    background-color: #FFFFFF;
+    transition: background-color 0.8s ease; 
+  }
+
+  .container {
+    padding: 30px;
+    border-radius: 15px;
+    background-color: rgba(255, 255, 255, 0.95);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+    text-align: center;
+    width: 80%;
+    max-width: 400px;
+  }
+
+  /* ESTADO: MOVIMENTO (VERMELHO) */
+  .movimento {
+    background-color: #FF0000 !important;
+  }
+  .movimento .container {
+    background-color: rgba(0, 0, 0, 0.7);
+    box-shadow: 0 0 30px rgba(255, 0, 0, 1);
+    color: white;
+  }
+  
+  /* ESTADO: LUZ (AMARELO DOURADO) */
+  .luz {
+    background-color: #FFD700 !important;
+  }
+  .luz .container {
+    background-color: rgba(255, 255, 255, 0.9);
+    box-shadow: 0 0 20px rgba(255, 215, 0, 0.8);
+    color: #333;
+  }
+  
+  #statusText {
+      font-size: 1.8em;
+      margin-top: 10px;
+  }
+  #detailText {
+      font-size: 1em;
+      color: #666;
+  }
+  .movimento #detailText {
+      color: #CCC;
+  }
+
+</style>
+</head>
+<body>
+
+<div id="statusContainer" class="container">
+  <h2>ESTADO HÍBRIDO</h2>
+  <p id="ipAddress">A ligar ao ESP32...</p>
+  <h1 id="statusText">PRONTO (NORMAL)</h1>
+  <p id="detailText">Monitorizando movimento e luminosidade...</p>
+</div>
+
+<script>
+  var ip = window.location.hostname; 
+  document.getElementById('ipAddress').textContent = 'Conectando-se a ws://' + ip + '/ws';
+  
+  var gateway = `ws://${ip}/ws`;
+  var websocket;
+
+  window.addEventListener('load', onLoad);
+
+  function onLoad() {
+    initWebSocket();
+  }
+
+  function initWebSocket() {
+    console.log('Tentando abrir conexão WebSocket...');
+    websocket = new WebSocket(gateway);
+    websocket.onopen    = onOpen;
+    websocket.onclose   = onClose;
+    websocket.onmessage = onMessage; 
+  }
+
+  function onOpen(event) {
+    console.log('Conexão aberta');
+    document.getElementById('ipAddress').textContent = 'Conectado. A monitorar ' + ip;
+  }
+
+  function onClose(event) {
+    console.log('Conexão fechada. Tentando reconectar...');
+    document.getElementById('ipAddress').textContent = 'Conexão perdida. A reconectar...';
+    setTimeout(initWebSocket, 2000); 
+  }
+
+  function onMessage(event) {
+    var estado = event.data; // Recebe "MOVIMENTO", "LUZ" ou "NORMAL"
+    console.log("Mensagem recebida: " + estado);
+    
+    var body = document.body;
+    var statusText = document.getElementById('statusText');
+    var detailText = document.getElementById('detailText');
+
+    // Limpa todas as classes de estado
+    body.classList.remove('movimento', 'luz'); 
+    
+    if (estado === "MOVIMENTO") {
+      body.classList.add('movimento'); 
+      statusText.textContent = "ALERTA: INTRUSO DETETADO!";
+      detailText.textContent = "Movimento detectado pelo radar. Perigo Iminente.";
+    } 
+    else if (estado === "LUZ") {
+      body.classList.add('luz'); 
+      statusText.textContent = "AVISO: LUMINOSIDADE BAIXA";
+      detailText.textContent = "O sensor LDR indica ambiente escuro (luz fraca).";
+    }
+    else { // "NORMAL"
+      statusText.textContent = "PRONTO (NORMAL)";
+      detailText.textContent = "Monitorizando movimento e luminosidade...";
+    }
+  }
+</script>
+
+</body>
+</html>
+)rawliteral";
