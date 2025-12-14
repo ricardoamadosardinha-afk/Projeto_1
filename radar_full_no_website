@@ -1,317 +1,330 @@
-// --- BIBLIOTECAS ---
-#include <ESP32Servo.h> 
 #include <SPI.h>
-#include "Ucglib.h"            
+#include <LovyanGFX.hpp> 
+#include <ESP32Servo.h>
 
-// --- PINOS ESP32-C6 ---
-#define  trigPin   4   
-#define  echoPin   5   
-#define  ServoPin  14 
-#define  ButtonPin 2  // Botão entre Pino 2 e GND
+// --- CONFIGURAÇÃO DO ECRÃ (LOVYANGFX) ---
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ILI9488 _panel_instance; 
+  lgfx::Bus_SPI       _bus_instance;   
 
-// --- DEFINIÇÕES GERAIS (AJUSTADAS PARA 480x320) ---
-int Ymax = 320;               // Aumentado de 240
-int Xmax = 480;               // Aumentado de 320
-int Xcent = Xmax / 2;         // 240
-int base = 290;               // Baixou para dar mais espaço vertical
-int scanline = 260;           // Raio da linha de varrimento aumentado
-int stepDelay = 40;           // Velocidade do varrimento
+public:
+  LGFX(void) {
+    {
+      auto cfg = _bus_instance.config();
+      
+      cfg.spi_host = SPI2_HOST; 
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000; 
+      cfg.freq_read  = 16000000;
+      cfg.spi_3wire  = false; 
+      cfg.use_lock   = true;
+      cfg.dma_channel = SPI_DMA_CH_AUTO;
 
-// --- MEMÓRIA DO RADAR (91 posições para ângulos 0 a 180, passo 2) ---
-int history0to180[91]; 
-int history180to0[91]; 
+      // Pinos ESP32-C6
+      cfg.pin_sclk = 21;  
+      cfg.pin_mosi = 19;  
+      cfg.pin_miso = -1;  
+      cfg.pin_dc   = 22;  
+      
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
 
-// --- VARIÁVEIS DE ESTADO ---
-bool initialScanDone = false; 
-bool systemActive = false; // Controla se o sistema já arrancou
+    {
+      auto cfg = _panel_instance.config();
 
+      cfg.pin_cs           = 15;  
+      cfg.pin_rst          = 23;  
+      cfg.pin_busy         = -1; 
+
+      cfg.panel_width      = 320;
+      cfg.panel_height     = 480;
+      cfg.offset_x         = 0;
+      cfg.offset_y         = 0;
+      cfg.offset_rotation  = 0;
+      cfg.dummy_read_pixel = 8;
+      cfg.dummy_read_bits  = 1;
+      cfg.readable         = false; 
+      cfg.invert           = false;
+      cfg.rgb_order        = false;
+      cfg.dlen_16bit       = false;
+      cfg.bus_shared       = false; 
+
+      _panel_instance.config(cfg);
+    }
+    
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX tft;                 
 Servo myServo; 
 
-// CONFIGURAÇÃO DO DISPLAY
-// IMPORTANTE: Para ecrãs 3.5" de 480x320, o driver geralmente é ILI9486 ou HX8357.
-// O ILI9341 geralmente só vai até 320x240.
-// Se a imagem ficar branca ou invertida, tenta "Ucglib_HX8357..."
-Ucglib_ILI9486_18x320x480_HWSPI ucg(/*cd=*/ 22, /*cs=*/ 15, /*reset=*/ 23);
+// --- PINOS ---
+#define trigPin   4   
+#define echoPin   5   
+#define ServoPin  14 
+#define ButtonPin 2 
+const int ldrPin = 1; // Pino do LDR
 
-void setup(void)
-{
-      // 1. Inicializar arrays a 0
-      for(int i=0; i<91; i++) {
-        history0to180[i] = 0;
-        history180to0[i] = 0;
-      }
+// --- DEFINIÇÕES DO RADAR ---
+#define MAX_DISTANCE_CM 150 
+#define SCAN_RADIUS 220     
+#define CENTER_X 240        
+#define CENTER_Y 300        
+int radarSpeed = 300; // Velocidade do Servo
 
-      // 2. Configuração de Hardware
-      myServo.setPeriodHertz(50); 
-      pinMode(trigPin, OUTPUT);       
-      pinMode(echoPin, INPUT);
-      pinMode(ButtonPin, INPUT_PULLUP); // Botão com resistência interna
-      
-      Serial.begin(115200);
-      Serial.println("--- RADAR A INICIALIZAR ---");
+// --- DEFINIÇÕES DE LUZ ---
+const int lightThreshold = 800; 
 
-      myServo.attach(ServoPin, 500, 2400); 
-      myServo.write(90); // Posição neutra ao ligar
+// --- MEMÓRIA ---
+int background0to180[91];   
+int background180to0[91];   
 
-      // 3. Inicializar TFT
-      ucg.begin(UCG_FONT_MODE_SOLID); 
-      
-      // Rotação ajustada. Se ficar de cabeça para baixo, tenta 0, 1, 2 ou 3.
-      ucg.setRotate90(); 
-      
-      // Ecrã de Boas Vindas / Standby (Ajustado para 480x320)
-      ucg.setFontMode(UCG_FONT_MODE_TRANSPARENT);
-      ucg.clearScreen();
-      ucg.setColor(0, 0, 100, 0); // Fundo verde escuro
-      ucg.drawGradientBox(0, 0, 480, 320);
-      
-      ucg.setColor(0, 255, 255, 255); // Branco
-      ucg.setFont(ucg_font_logisoso32_tf);
-      ucg.setPrintPos(120, 120); // Centralizado X
-      ucg.print("SISTEMA");
-      ucg.setPrintPos(130, 160);
-      ucg.print("PRONTO");
-      
-      ucg.setFont(ucg_font_courB14_tf);
-      ucg.setColor(0, 255, 255, 0); // Amarelo
-      ucg.setPrintPos(130, 240);
-      ucg.print("PRESSIONE BOTAO...");
-      
-      Serial.println("AGUARDANDO BOTAO...");
+bool calibrated = false;    
+bool systemActive = false;  
+
+void setup() {
+  // 1. Hardware Init
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ButtonPin, INPUT_PULLUP);
+  
+  // Configuração LDR
+  pinMode(ldrPin, INPUT);
+  analogReadResolution(12); // Garante leitura 0-4095
+  
+  for(int i=0; i<91; i++) {
+    background0to180[i] = 0;
+    background180to0[i] = 0;
+  }
+
+  myServo.setPeriodHertz(50);
+  myServo.attach(ServoPin, 500, 2400);
+  myServo.write(90);
+
+  Serial.begin(115200);
+
+  // 2. TFT Init
+  tft.init();
+  tft.setRotation(1); 
+  tft.fillScreen(TFT_BLACK);
+
+  // Ecrã de Boot
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCenterString("SISTEMA HIBRIDO", CENTER_X, 80);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawCenterString("PRESSIONE BOTAO", CENTER_X, 120);
+  tft.drawCenterString("SERIAL DEBUG ATIVO", CENTER_X, 150);
+  
+  Serial.println("--- SISTEMA INICIADO ---");
+  Serial.println("Aguardando botao para calibrar...");
 }
 
-// --- FUNÇÕES AUXILIARES DE DESENHO (AJUSTADAS) ---
-void cls() {
-  ucg.setColor(0, 0, 0, 0);
-  for(int s=0;s<320;s++) { // Altura 320
-    ucg.drawHLine(0,s,480); // Largura 480
+int calculateDistance() { 
+  digitalWrite(trigPin, LOW); 
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); 
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000); 
+  if(duration == 0) return MAX_DISTANCE_CM + 10; 
+  return duration * 0.034 / 2;
+}
+
+// --- FUNÇÃO DE LUZ (Agora retorna int) ---
+int verificarLuz() {
+  int sensorValue = analogRead(ldrPin);
+  
+  // Desenho na GUI
+  tft.fillRect(0, 40, 140, 40, TFT_BLACK); 
+  
+  if (sensorValue < lightThreshold) {
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 45);
+    tft.print("ALERTA LUZ!");
+    
+    tft.setTextSize(1);
+    tft.setCursor(10, 65);
+    tft.print("Val: "); tft.print(sensorValue);
+  } else {
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(10, 45);
+    tft.print("Luz Normal");
+    tft.setCursor(10, 60);
+    tft.print("Val: "); tft.print(sensorValue);
+  }
+  
+  return sensorValue; // Retorna para usarmos no Serial
+}
+
+void drawGrid() {
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS, TFT_DARKGREEN);       
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.66, TFT_DARKGREEN);  
+  tft.drawCircle(CENTER_X, CENTER_Y, SCAN_RADIUS*0.33, TFT_DARKGREEN);  
+
+  for (int i=30; i<=150; i+=30) {
+    float rad = radians(i);
+    int x = CENTER_X + SCAN_RADIUS * cos(rad);
+    int y = CENTER_Y - SCAN_RADIUS * sin(rad);
+    tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
   }
 }
 
-void fix_font() {
-      ucg.setColor(0, 180, 0);
-      ucg.setFont(ucg_font_helvR08_hr);
-      // Posições ajustadas para os novos raios (280, 185, 90) a partir da base 290
-      // X = 244 (ligeiramente à direita do centro 240)
-      ucg.setPrintPos(244, 20);  // ~1.00m (Topo)
-      ucg.print("1.00");
-      ucg.setPrintPos(244, 110); // ~0.60m
-      ucg.print("0.60");
-      ucg.setPrintPos(244, 205); // ~0.30m
-      ucg.print("0.30");
+void renderRadarLine(int angle, int distance, bool isIntruder) {
+  float rad = radians(angle);
+  float cosA = cos(rad);
+  float sinA = sin(rad);
+
+  int lineX = CENTER_X + SCAN_RADIUS * cosA;
+  int lineY = CENTER_Y - SCAN_RADIUS * sinA;
+  tft.drawLine(CENTER_X, CENTER_Y, lineX, lineY, TFT_GREEN);
+
+  if (isIntruder && distance < MAX_DISTANCE_CM) {
+    int pixelDist = map(distance, 0, MAX_DISTANCE_CM, 0, SCAN_RADIUS);
+    int objX = CENTER_X + pixelDist * cosA;
+    int objY = CENTER_Y - pixelDist * sinA;
+    
+    tft.fillCircle(objX, objY, 5, TFT_RED);
+    
+    tft.fillRect(0, 0, 140, 35, TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK); 
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.print("INTRUSO!");
+  } else {
+    tft.fillRect(0, 0, 140, 35, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(10, 10);
+    tft.print("Radar Scan...");
+  }
+
+  // Debug Ecrã
+  tft.fillRect(380, 0, 100, 40, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(390, 5); tft.print("Ang: "); tft.print(angle);
+  tft.setCursor(390, 20); tft.print("Dst: "); tft.print(distance);
 }
 
-void fix() {
-      ucg.setColor(0, 180, 0);
-      
-      // Novos Raios para preencher 480x320
-      int rLarge = 280;
-      int rMed = 185;
-      int rSmall = 90;
-
-      ucg.drawDisc(Xcent, base+1, 4, UCG_DRAW_ALL); 
-      
-      // Círculos Concêntricos
-      ucg.drawCircle(Xcent, base+1, rLarge, UCG_DRAW_UPPER_LEFT);
-      ucg.drawCircle(Xcent, base+1, rLarge, UCG_DRAW_UPPER_RIGHT);
-      ucg.drawCircle(Xcent, base+1, rMed, UCG_DRAW_UPPER_LEFT);
-      ucg.drawCircle(Xcent, base+1, rMed, UCG_DRAW_UPPER_RIGHT);
-      ucg.drawCircle(Xcent, base+1, rSmall, UCG_DRAW_UPPER_LEFT);
-      ucg.drawCircle(Xcent, base+1, rSmall, UCG_DRAW_UPPER_RIGHT);
-      ucg.drawLine(0, base+1, Xmax, base+1);
-      
-      ucg.setColor(0, 180, 0);
-       for(int i= 40;i < 300; i+=2) {
-        // Ticks ajustados para o raio ~260-280
-        if (i % 10 == 0) 
-          ucg.drawLine(260*cos(radians(i))+Xcent,base - 260*sin(radians(i)) , 280*cos(radians(i))+Xcent,base - 280*sin(radians(i)));
-        else
-          ucg.drawLine(270*cos(radians(i))+Xcent,base - 270*sin(radians(i)) , 280*cos(radians(i))+Xcent,base - 280*sin(radians(i)));
-       }
+void clearRadarLine(int angle) {
+  float rad = radians(angle);
+  int x = CENTER_X + SCAN_RADIUS * cos(rad);
+  int y = CENTER_Y - SCAN_RADIUS * sin(rad);
+  tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_BLACK);
+  
+  if (angle % 30 == 0) tft.drawLine(CENTER_X, CENTER_Y, x, y, TFT_DARKGREEN);
 }
 
-// --- LÓGICA DO RADAR (MANTIDA) ---
-int calculateDistance() { 
-      long duration;
-      digitalWrite(trigPin, LOW); 
-      delayMicroseconds(2);
-      digitalWrite(trigPin, HIGH); 
-      delayMicroseconds(10);
-      digitalWrite(trigPin, LOW);
-      duration = pulseIn(echoPin, HIGH);
-      return duration*0.034/2;
+// --- FUNÇÃO AUXILIAR PARA IMPRIMIR SERIAL ---
+void printDebug(int angle, int dist, int light, bool intruder) {
+  Serial.print("ANG: "); 
+  if(angle < 10) Serial.print("00");
+  else if(angle < 100) Serial.print("0");
+  Serial.print(angle);
+  
+  Serial.print("\t| DIST: "); 
+  Serial.print(dist);
+  Serial.print("cm");
+  
+  Serial.print("\t| LUZ: "); 
+  Serial.print(light);
+  
+  // Marcadores visuais de alerta
+  if (intruder) Serial.print(" \t[ALERTA MOVIMENTO !!!]");
+  if (light < lightThreshold) Serial.print(" \t[ALERTA LUZ !!!]");
+  
+  Serial.println(); // Nova linha
 }
 
-bool processarLogicaRadar(int angulo, int distanciaAtual, bool sentido0to180) {
-    int* memoriaAtual = sentido0to180 ? history0to180 : history180to0;
-    int index = angulo / 2;
-    int distanciaAntiga = memoriaAtual[index];
-    bool alerta = false;
-
-    if (!initialScanDone) {
-        memoriaAtual[index] = distanciaAtual;
-        return false; 
-    }
-
-    if (abs(distanciaAtual - distanciaAntiga) > 20 && distanciaAntiga > 0) {
-        alerta = true;
-    }
-    return alerta;
-}
-
-// --- DESENHO DINÂMICO (AJUSTADO ESCALA) ---
-void desenharRadar(int x, int distance, bool alerta, bool sentidoInverso) {
-      // 1. Linhas de Varrimento
-      int f = sentidoInverso ? (x - 4) : (x + 4); 
-      
-      ucg.setColor(0, 255, 0); 
-      ucg.drawLine(Xcent, base, scanline*cos(radians(f))+Xcent,base - scanline*sin(radians(f)));
-      
-      f = sentidoInverso ? (f + 2) : (f - 2);
-      ucg.setColor(0, 128, 0); 
-      ucg.drawLine(Xcent, base, scanline*cos(radians(f))+Xcent,base - scanline*sin(radians(f)));
-      
-      f = sentidoInverso ? (f + 2) : (f - 2);
-      ucg.setColor(0, 0, 0);   
-      ucg.drawLine(Xcent, base, scanline*cos(radians(f))+Xcent,base - scanline*sin(radians(f)));
-      
-      // 2. Pontos de Deteção
-      if (alerta) {
-          ucg.setColor(255, 0, 255); // ROXO = ALERTA
-      } else if (distance < 100) {
-          ucg.setColor(255, 0, 0);   // VERMELHO = PERTO
-      } else {
-          ucg.setColor(255, 255, 0); // AMARELO = LONGE
-      }
-
-      // --- ESCALA 480x320 ---
-      // Alcance visual maximo: ~280 pixéis
-      // Se alcance real for 100cm -> Fator = 2.8
-      float scaleFactor = 2.8; 
-
-      if (distance < 100) {
-          ucg.drawDisc(scaleFactor*distance*cos(radians(x))+ Xcent,-scaleFactor*distance*sin(radians(x))+base, 2, UCG_DRAW_ALL);
-      } else {
-          // Desenha no limite visual (280px)
-          ucg.drawDisc(280*cos(radians(x))+Xcent,-280*sin(radians(x))+base, 2, UCG_DRAW_ALL);
-      }
-      
-      ucg.setColor(0, 200, 0); 
-}
-
-void desenharTextoInfo(int x, int distance, bool alerta) {
-      ucg.setFont(ucg_font_helvR08_hr);
-      
-      // Caixa de texto movida para o fundo (Y=300) e mais larga
-      ucg.setColor(0,0,0);
-      ucg.drawBox(0, 300, 480, 20);
-
-      ucg.setColor(255,255,  0);
-      ucg.setPrintPos(40,312); // Posições X espaçadas para ecrã largo
-      ucg.print("DEG: "); 
-      ucg.print(x);
-      
-      ucg.setPrintPos(200,312);
-      ucg.print("DIST: ");
-      ucg.print(distance);
-      ucg.print(" cm"); 
-
-      if(alerta) {
-        ucg.setColor(255, 0, 255);
-        ucg.setPrintPos(360, 312);
-        ucg.print("ALERTA!");
-      } else if (!initialScanDone) {
-        ucg.setColor(0, 255, 255);
-        ucg.setPrintPos(360, 312);
-        ucg.print("A CALIBRAR...");
-      }
-}
-
-void loop(void)
-{
-  // --- 1. MODO DE ESPERA ---
+void loop() {
+  // --- MODO CALIBRAÇÃO ---
   if (!systemActive) {
     if (digitalRead(ButtonPin) == LOW) {
-      Serial.println(">>> INICIANDO SISTEMA... <<<");
+      Serial.println(">>> INICIANDO CALIBRACAO <<<");
+      tft.fillScreen(TFT_BLACK);
       
-      cls();
-      ucg.setFontMode(UCG_FONT_MODE_SOLID);
-      fix();
-      fix_font();
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.drawCenterString("CALIBRAR IDA...", CENTER_X, 140);
+      for(int i=0; i<=180; i+=2) {
+        myServo.write(i);
+        delay(radarSpeed);
+        background0to180[i/2] = calculateDistance();
+      }
+
+      tft.fillScreen(TFT_BLACK);
       
-      systemActive = true; 
+      tft.drawCenterString("CALIBRAR VOLTA...", CENTER_X, 140);
+      for(int i=180; i>=0; i-=2) {
+        myServo.write(i);
+        delay(radarSpeed);
+        background180to0[i/2] = calculateDistance();
+      }
+      
+      calibrated = true;
+      systemActive = true;
+      Serial.println(">>> CALIBRACAO CONCLUIDA <<<");
+      tft.fillScreen(TFT_BLACK);
+      drawGrid();
     } else {
-      return; 
+      // Mesmo em espera, mostra a luz no serial para testar o LDR
+      int valLuz = verificarLuz();
+      Serial.print("STANDBY - LUZ: "); Serial.println(valLuz);
+      delay(200);
+      return;
     }
   }
 
-  // --- 2. SISTEMA ATIVO ---
-  int distance;
-  int storedValue; 
-  bool alertaDetectado = false;
-  
-  if (initialScanDone) {
-      // Refresh opcional
+  // --- MODO ATIVO (IDA) ---
+  for (int i=0; i<=180; i+=2) {
+    myServo.write(i);
+    delay(radarSpeed); 
+    if(i > 0) clearRadarLine(i-2);
+
+    int distAtual = calculateDistance();
+    bool intruso = false;
+    int index = i / 2;
+    int distFundo = background0to180[index]; 
+
+    if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
+      intruso = true;
+    } else {
+      if (abs(distAtual - distFundo) < 5) background0to180[index] = distAtual; 
+    }
+
+    renderRadarLine(i, distAtual, intruso);
+    int valLuz = verificarLuz();
+    
+    // OUTPUT SERIAL
+    printDebug(i, distAtual, valLuz, intruso);
   }
+  clearRadarLine(180);
 
-  // SWEEP 0 -> 180
-  for (int x = 0; x <= 180; x += 2){      
-      
-      myServo.write(x);              
-      delay(stepDelay); 
-      
-      distance = calculateDistance();
-      alertaDetectado = processarLogicaRadar(x, distance, true);
-      storedValue = history0to180[x/2]; 
+  // --- MODO ATIVO (VOLTA) ---
+  for (int i=180; i>=0; i-=2) {
+    myServo.write(i);
+    delay(radarSpeed);
+    if(i < 180) clearRadarLine(i+2);
 
-      desenharRadar(x, distance, alertaDetectado, false);
-      
-      if (x % 2 == 0) { 
-        if (x > 70 and x < 110) fix_font(); 
-        desenharTextoInfo(x, distance, alertaDetectado);
-        
-        Serial.print("DIR: >> | Ang: "); Serial.print(x); 
-        Serial.print(" | Dist: "); Serial.print(distance); 
-        Serial.print(" | Mem: "); Serial.print(storedValue);
-        if(alertaDetectado) Serial.print(" [ALERTA]");
-        Serial.println();
-      }
+    int distAtual = calculateDistance();
+    bool intruso = false;
+    int index = i / 2;
+    int distFundo = background180to0[index];
+
+    if (abs(distAtual - distFundo) > 10 && distAtual < MAX_DISTANCE_CM && distAtual > 0) {
+      intruso = true;
+    } else {
+      if (abs(distAtual - distFundo) < 5) background180to0[index] = distAtual;
+    }
+
+    renderRadarLine(i, distAtual, intruso);
+    int valLuz = verificarLuz();
+
+    // OUTPUT SERIAL
+    printDebug(i, distAtual, valLuz, intruso);
   }
-
-  delay(500); 
-
-  // SWEEP 180 -> 0
-  for (int x = 180; x >= 0; x -= 2){       
-      
-      myServo.write(x);              
-      delay(stepDelay);
-      
-      distance = calculateDistance();
-      alertaDetectado = processarLogicaRadar(x, distance, false); 
-      storedValue = history180to0[x/2];
-
-      desenharRadar(x, distance, alertaDetectado, true);
-
-      if (x % 2 == 0) {
-        if (x > 70 and x < 110) fix_font();
-        desenharTextoInfo(x, distance, alertaDetectado);
-
-        Serial.print("DIR: << | Ang: "); Serial.print(x); 
-        Serial.print(" | Dist: "); Serial.print(distance); 
-        Serial.print(" | Mem: "); Serial.print(storedValue);
-        if(alertaDetectado) Serial.print(" [ALERTA]");
-        Serial.println();
-      }
-  }
-
-  delay(500); 
-  
-  cls(); 
-  fix();
-  fix_font();
-
-  if (!initialScanDone) {
-    initialScanDone = true;
-    Serial.println("--- CALIBRAÇÃO CONCLUÍDA ---");
-  }
+  clearRadarLine(0);
 }
